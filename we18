@@ -1,0 +1,878 @@
+--[[
+  KeyGuardian Validator v2.2 - Fixed Version
+  Cloudflare Pages Backend Integration
+]]
+local function print()end
+local function warn()end
+
+
+local Validator = {}
+
+-- Configuration
+local API_BASE = "https://keyguardian-backend.pages.dev/api"
+local DEBUG_MODE = false
+local NoNOBFUSCATEDDEBUG_MODE = false
+local currentToken = nil
+local currentHWID = nil
+local loaderCallback = nil
+local currentDiscordInvite = nil
+local currentTime = nil
+
+-- Debug function
+debug = function(message, data)
+    if DEBUG_MODE then
+        warn("[KeyGuardian Debug] " .. tostring(message))
+        if data ~= nil then
+            if typeof(data) == "table" then
+                local ok, json = pcall(function()
+                    return game:GetService("HttpService"):JSONEncode(data)
+                end)
+                if ok then
+                    warn("[KeyGuardian Debug] Data: " .. json)
+                else
+                    warn("[KeyGuardian Debug] Data (table, encode error): " .. tostring(data))
+                end
+            else
+                warn("[KeyGuardian Debug] Data: " .. tostring(data))
+            end
+        end
+    end
+end
+
+-- Check if file functions exist
+local function checkFileFunctions()
+    local hasWriteFile = typeof(writefile) == "function"
+    local hasReadFile = typeof(readfile) == "function"
+    local hasIsFile = typeof(isfile) == "function"
+    local hasDelFile = typeof(delfile) == "function"
+    
+    debug("File functions check", {
+        writefile = hasWriteFile,
+        readfile = hasReadFile,
+        isfile = hasIsFile,
+        delfile = hasDelFile
+    })
+    
+    return hasWriteFile and hasReadFile and hasIsFile and hasDelFile
+end
+
+-- Get HWID from Roblox
+local function getHWID()
+    local success, hwid = pcall(function()
+        return game:GetService("RbxAnalyticsService"):GetClientId()
+    end)
+    
+    if success and hwid then
+        debug("HWID obtained: " .. tostring(hwid))
+        return tostring(hwid)
+    else
+        debug("Failed to get HWID, using fallback")
+        return "unknown_hwid_" .. tostring(tick())
+    end
+end
+
+-- Make HTTP request to backend
+local function makeRequest(endpoint, method, body)
+    local url = API_BASE .. endpoint
+    local options = {
+        Url = url,
+        Method = method or "GET",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["User-Agent"] = "KeyGuardian-Validator/2.2"
+        }
+    }
+    
+    if body then
+        options.Body = game:GetService("HttpService"):JSONEncode(body)
+    end
+    
+    debug("Making request", options)
+    local success, response = pcall(function()
+        return request(options)
+    end)
+    
+    if not success then
+        debug("Request pcall failed", response)
+        return nil
+    end
+    
+    if response and response.Body and (response.StatusCode == 200 or response.StatusCode == 201 or response.StatusCode == 404) then
+        local ok, decoded = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(response.Body)
+        end)
+        if ok and decoded then
+            debug("Decoded JSON", decoded)
+            return decoded
+        else
+            debug("JSON decode error", response.Body)
+            return nil
+        end
+    else
+        debug("Request failed", response)
+        return nil
+    end
+end
+
+-- Discord RPC join fonksiyonu
+local function joinDiscordInvite(inviteCode)
+    if not inviteCode or inviteCode == "YOK" or inviteCode == "" then
+        debug("No valid Discord invite code")
+        return
+    end
+    
+    local HttpService = game:GetService("HttpService")
+    local payload = HttpService:JSONEncode({
+        cmd = "INVITE_BROWSER",
+        nonce = HttpService:GenerateGUID(false),
+        args = { code = inviteCode }
+    })
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Origin"] = "https://discord.com"
+    }
+    pcall(function()
+        if typeof(request) == "function" then
+            request({
+                Url = "http://127.0.0.1:6463/rpc?v=1",
+                Method = "POST",
+                Headers = headers,
+                Body = payload
+            })
+        else
+            HttpService:PostAsync("http://127.0.0.1:6463/rpc?v=1", payload, Enum.HttpContentType.ApplicationJson, false, headers)
+        end
+    end)
+end
+
+-- Backend'den token, discord url ve süreyi al
+local function getTokenDiscordDuration()
+    local result = makeRequest("/token")
+    if result and result.token and result.discord_invite and result.duration then
+        debug("Token, Discord invite ve duration alındı", result)
+        return result.token, result.discord_invite, result.duration
+    else
+        debug("Token/Discord/duration alınamadı", result)
+        return nil, nil, nil
+    end
+end
+
+-- Check if HWID is in premium keys
+local function checkPremiumHWID(hwid)
+    debug("Checking premium HWID: " .. hwid)
+    local result = makeRequest("/check-premium-hwid", "POST", {
+        hwid = hwid
+    })
+    
+    if result and result.success and result.found then
+        debug("HWID found in premium keys")
+        return true, result.key
+    else
+        debug("HWID not found in premium keys")
+        return false, nil
+    end
+end
+
+-- Check if HWID is banned
+local function checkBannedHWID(hwid)
+    debug("Checking banned HWID: " .. hwid)
+    local result = makeRequest("/banned-keys")
+    
+    if result and result.success and result.data then
+        for _, bannedKey in pairs(result.data) do
+            if bannedKey.hwid == hwid then
+                debug("HWID found in banned list")
+                return true
+            end
+        end
+    end
+    
+    debug("HWID not found in banned list")
+    return false
+end
+
+-- Validate key
+local function validateKey(key, hwid)
+    debug("Validating key: " .. key .. " with HWID: " .. hwid)
+    local result = makeRequest("/validate-key", "POST", {
+        key = key,
+        hwid = hwid
+    })
+    
+    if result then
+        debug("Validation result: " .. tostring(result.success))
+        if result.message then
+            debug("Message: " .. result.message)
+        end
+        return result
+    else
+        debug("Validation request failed")
+        return {
+            success = false,
+            message = "Network error",
+            type = "network_error"
+        }
+    end
+end
+
+-- Setup function (token validation)
+function Validator.Setup(token, loader)
+    debug("Setting up validator with token: " .. tostring(token))
+    
+    loaderCallback = loader
+    currentHWID = getHWID()
+    
+    local backendToken, backendDiscord, backendTime = getTokenDiscordDuration()
+    if not backendToken then
+        debug("Failed to get token from backend")
+        return false
+    end
+    
+    currentToken = backendToken
+    currentDiscordInvite = backendDiscord
+    currentTime = backendTime
+    
+    if token ~= backendToken then
+        debug("Token mismatch: provided=" .. tostring(token) .. ", backend=" .. tostring(backendToken))
+        return false
+    end
+    
+    debug("Setup completed successfully")
+    if currentDiscordInvite and currentDiscordInvite ~= "YOK" then
+        joinDiscordInvite(currentDiscordInvite)
+    end
+    return true
+end
+
+-- Süreyi parse eden fonksiyon
+local function parseDuration(durationStr)
+    if not durationStr or type(durationStr) ~= "string" then return 0 end
+    local num, unit = durationStr:match("^(%d+)([smhd])$")
+    num = tonumber(num)
+    if not num then return 0 end
+    if unit == "s" then return num end
+    if unit == "m" then return num * 60 end
+    if unit == "h" then return num * 3600 end
+    if unit == "d" then return num * 86400 end
+    return 0
+end
+
+-- ============================================================================
+-- DÜZELTILMIŞ KEY SAVE SİSTEMİ
+-- ============================================================================
+
+local SAVED_KEY_FILE = "Kanistay_savedkey.json"
+local OBFUSCATE_VERSION = "KST_V2.2"
+local MAGIC_SIGNATURE = "KANISTAY_GUARDIAN_2024"
+
+-- Basit ama güvenilir Base64 implementasyonu
+local Base64 = {}
+do
+    local chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    
+    function Base64.encode(data)
+        local result = ""
+        local padding = ""
+        
+        for i = 1, #data, 3 do
+            local a, b, c = string.byte(data, i, i + 2)
+            b = b or 0
+            c = c or 0
+            
+            local bitmap = a * 65536 + b * 256 + c
+            
+            result = result .. chars:sub(math.floor(bitmap / 262144) + 1, math.floor(bitmap / 262144) + 1)
+            result = result .. chars:sub(math.floor((bitmap % 262144) / 4096) + 1, math.floor((bitmap % 262144) / 4096) + 1)
+            
+            if i + 1 <= #data then
+                result = result .. chars:sub(math.floor((bitmap % 4096) / 64) + 1, math.floor((bitmap % 4096) / 64) + 1)
+            else
+                padding = padding .. "="
+            end
+            
+            if i + 2 <= #data then
+                result = result .. chars:sub((bitmap % 64) + 1, (bitmap % 64) + 1)
+            else
+                padding = padding .. "="
+            end
+        end
+        
+        return result .. padding
+    end
+    
+    function Base64.decode(data)
+        data = data:gsub('[^' .. chars .. '=]', '')
+        local result = ""
+        
+        for i = 1, #data, 4 do
+            local a, b, c, d = data:sub(i, i), data:sub(i+1, i+1), data:sub(i+2, i+2), data:sub(i+3, i+3)
+            
+            local aNum = chars:find(a) - 1
+            local bNum = chars:find(b) - 1
+            local cNum = c ~= '=' and (chars:find(c) - 1) or 0
+            local dNum = d ~= '=' and (chars:find(d) - 1) or 0
+            
+            local bitmap = aNum * 262144 + bNum * 4096 + cNum * 64 + dNum
+            
+            result = result .. string.char(math.floor(bitmap / 65536))
+            if c ~= '=' then
+                result = result .. string.char(math.floor((bitmap % 65536) / 256))
+            end
+            if d ~= '=' then
+                result = result .. string.char(bitmap % 256)
+            end
+        end
+        
+        return result
+    end
+end
+
+-- Basit XOR şifreleme
+local function simpleXOR(data, key)
+    local result = {}
+    local keyLen = #key
+    
+    for i = 1, #data do
+        local dataByte = string.byte(data, i)
+        local keyByte = string.byte(key, ((i - 1) % keyLen) + 1)
+        table.insert(result, string.char(bit32.bxor(dataByte, keyByte)))
+    end
+    
+    return table.concat(result)
+end
+
+-- Rastgele string üretici
+local function generateRandom(length)
+    local chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    local result = {}
+    
+    for i = 1, length do
+        local randomIndex = math.random(1, #chars)
+        table.insert(result, chars:sub(randomIndex, randomIndex))
+    end
+    
+    return table.concat(result)
+end
+
+-- Basit hash fonksiyonu
+local function simpleHash(data)
+    local hash = 5381
+    for i = 1, #data do
+        hash = ((hash * 33) + string.byte(data, i)) % 2147483647
+    end
+    return string.format("%08x", hash)
+end
+
+-- Key kaydetme fonksiyonu
+local function saveObfuscatedKey(key, hwid, duration)
+    debug("Attempting to save obfuscated key")
+    
+    -- File functions kontrolü
+    if not checkFileFunctions() then
+        debug("File functions not available, cannot save key")
+        return false
+    end
+    
+    -- Key data oluştur
+    local keyData = {
+        version = OBFUSCATE_VERSION,
+        signature = MAGIC_SIGNATURE,
+        key = key,
+        hwid = hwid,
+        savedAt = os.time(),
+        duration = duration,
+        nonce = generateRandom(16)
+    }
+    
+    -- JSON'a çevir
+    local jsonData = game:GetService("HttpService"):JSONEncode(keyData)
+    debug("Key data created", {size = #jsonData})
+    
+    -- Şifreleme anahtarı oluştur
+    local salt = generateRandom(8)
+    local encryptionKey = salt .. "_KST_" .. hwid:sub(1, 6)
+    
+    -- Şifrele
+    local encrypted = simpleXOR(jsonData, encryptionKey)
+    
+    -- Base64 encode
+    local encoded = Base64.encode(encrypted)
+    
+    -- Hash hesapla
+    local dataHash = simpleHash(encoded .. salt)
+    
+    -- Final structure
+    local finalData = {
+        v = OBFUSCATE_VERSION,
+        s = salt,
+        h = dataHash,
+        d = encoded
+    }
+    
+    local finalJson = game:GetService("HttpService"):JSONEncode(finalData)
+    
+    -- Obfuscated content oluştur
+    local lines = {}
+    local totalLines = math.random(6, 10)
+    local dataLine = math.random(2, totalLines - 1)
+    
+    for i = 1, totalLines do
+        if i == dataLine then
+            local prefix = generateRandom(math.random(4, 8))
+            local suffix = generateRandom(math.random(4, 8))
+            lines[i] = prefix .. "KST:" .. Base64.encode(finalJson) .. ":TSK" .. suffix
+        else
+            lines[i] = generateRandom(math.random(20, 40))
+        end
+    end
+    
+    local fileContent = table.concat(lines, "\n")
+    
+    -- Dosyaya yaz
+    local success = pcall(function()
+        writefile(SAVED_KEY_FILE, fileContent)
+    end)
+    
+    if success then
+        debug("Key successfully saved")
+        return true
+    else
+        debug("Failed to save key file")
+        return false
+    end
+end
+
+-- Key okuma fonksiyonu
+local function readObfuscatedKey()
+    debug("Attempting to read obfuscated key")
+    
+    -- File functions kontrolü
+    if not checkFileFunctions() then
+        debug("File functions not available")
+        return nil
+    end
+    
+    -- Dosya var mı kontrol et
+    if not isfile(SAVED_KEY_FILE) then
+        debug("Saved key file not found")
+        return nil
+    end
+    
+    -- Dosyayı oku
+    local fileContent
+    local success = pcall(function()
+        fileContent = readfile(SAVED_KEY_FILE)
+    end)
+    
+    if not success or not fileContent then
+        debug("Failed to read saved key file")
+        return nil
+    end
+    
+    debug("File content read successfully", {size = #fileContent})
+    
+    -- Data line'ı bul
+    local finalData = nil
+    for line in fileContent:gmatch("[^\n]+") do
+        local dataStart = line:find("KST:", 1, true)
+        local dataEnd = line:find(":TSK", 1, true)
+        
+        if dataStart and dataEnd then
+            local encodedData = line:sub(dataStart + 4, dataEnd - 1)
+            debug("Found encoded data", {size = #encodedData})
+            
+            local decodeSuccess, decodedJson = pcall(function()
+                return Base64.decode(encodedData)
+            end)
+            
+            if decodeSuccess and decodedJson then
+                debug("Successfully decoded base64")
+                local parseSuccess, parsedData = pcall(function()
+                    return game:GetService("HttpService"):JSONDecode(decodedJson)
+                end)
+                
+                if parseSuccess and parsedData and parsedData.v == OBFUSCATE_VERSION then
+                    debug("Successfully parsed final data")
+                    finalData = parsedData
+                    break
+                else
+                    debug("Failed to parse final data or version mismatch")
+                end
+            else
+                debug("Failed to decode base64")
+            end
+        end
+    end
+    
+    if not finalData then
+        debug("Could not find valid data in saved key file")
+        return nil
+    end
+    
+    -- Hash doğrula
+    local expectedHash = simpleHash(finalData.d .. finalData.s)
+    if finalData.h ~= expectedHash then
+        debug("Hash verification failed")
+        return nil
+    end
+    
+    debug("Hash verification passed")
+    
+    -- Şifreleme anahtarını yeniden oluştur
+    local encryptionKey = finalData.s .. "_KST_" .. currentHWID:sub(1, 6)
+    
+    -- Veriyi decode et
+    local decoded = Base64.decode(finalData.d)
+    
+    -- Şifreyi çöz
+    local decrypted = simpleXOR(decoded, encryptionKey)
+    
+    -- Key data'yı parse et
+    local parseSuccess, keyData = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(decrypted)
+    end)
+    
+    if not parseSuccess or not keyData then
+        debug("Failed to parse decrypted key data")
+        return nil
+    end
+    
+    debug("Successfully parsed key data")
+    
+    -- Signature kontrolü
+    if keyData.signature ~= MAGIC_SIGNATURE then
+        debug("Signature verification failed")
+        return nil
+    end
+    
+    -- HWID kontrolü
+    if keyData.hwid ~= currentHWID then
+        debug("HWID mismatch", {saved = keyData.hwid, current = currentHWID})
+        return nil
+    end
+    
+    -- Süre kontrolü
+    local durationSec = parseDuration(keyData.duration)
+    if durationSec == 0 then durationSec = 36000 end -- fallback: 10 saat
+    
+    if os.time() > (keyData.savedAt + durationSec) then
+        debug("Saved key has expired")
+        return nil
+    end
+    
+    debug("All verifications passed, key is valid")
+    return keyData
+end
+
+-- Saved key dosyasını sil
+local function removeSavedKey()
+    if not checkFileFunctions() then
+        debug("File functions not available, cannot remove saved key")
+        return
+    end
+    
+    if isfile(SAVED_KEY_FILE) then
+        local success = pcall(function()
+            delfile(SAVED_KEY_FILE)
+        end)
+        if success then
+            debug("Saved key file deleted successfully")
+        else
+            debug("Failed to delete saved key file")
+        end
+    else
+        debug("Saved key file does not exist")
+    end
+end
+
+-- ============================================================================
+-- ANA FONKSİYONLAR
+-- ============================================================================
+
+-- Start validation process
+function Validator.StartValidation()
+    debug("Starting validation process...")
+    if not currentHWID then
+        debug("No HWID available")
+        return
+    end
+    
+    -- Saved key kontrolü
+    local savedKeyData = readObfuscatedKey()
+    if savedKeyData then
+        debug("Valid saved key found, auto-validating user")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Saved Key Used", "success")
+        end
+        if _G.SystemUserValidated then
+            _G.SystemUserValidated(currentHWID, savedKeyData.key, "saved")
+        end
+        if loaderCallback then loaderCallback() end
+        return
+    end
+    
+    -- Eğer saved key okunamadıysa, dosyayı temizle
+    removeSavedKey()
+    
+    -- Banned HWID kontrolü
+    if checkBannedHWID(currentHWID) then
+        debug("HWID is banned - validation failed")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Your HWID is banned from using this system.", "error")
+        end
+        return
+    end
+    
+    -- Premium HWID kontrolü
+    local isPremium, premiumKey = checkPremiumHWID(currentHWID)
+    if isPremium then
+        if premiumKey and not premiumKey.expired then
+            debug("Premium HWID found and valid - auto validation")
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Premium access detected! Loading system...", "success")
+            end
+            if _G.SystemUserValidated then
+                _G.SystemUserValidated(currentHWID, premiumKey.key, "premium")
+            end
+            if loaderCallback then loaderCallback() end
+            return
+        else
+            debug("Premium HWID found but expired")
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Your premium access has expired.", "warning")
+            end
+        end
+    end
+    
+    debug("No saved key, no premium access - showing key input")
+    if _G.SystemShowKeyInput then
+        _G.SystemShowKeyInput()
+    end
+end
+
+-- Rate limiting
+local RATE_LIMIT_WINDOW = 20
+local RATE_LIMIT_MAX = 4
+local validateTimestamps = {}
+
+local function canValidate()
+    local now = tick()
+    -- Eski timestamp'leri temizle
+    for i = #validateTimestamps, 1, -1 do
+        if now - validateTimestamps[i] > RATE_LIMIT_WINDOW then
+            table.remove(validateTimestamps, i)
+        end
+    end
+    
+    if #validateTimestamps >= RATE_LIMIT_MAX then
+        local waitTime = math.ceil(RATE_LIMIT_WINDOW - (now - validateTimestamps[1]))
+        return false, waitTime
+    end
+    
+    table.insert(validateTimestamps, now)
+    return true, 0
+end
+
+-- Try saved key in listen mode
+function Validator.TrySavedKey(token, loader)
+    local savedKeyData = readObfuscatedKey()
+    if savedKeyData then
+        debug("Trying saved key in listen mode")
+        Validator.ValidateKey(token, savedKeyData.key, function()
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Saved Key Used", "success")
+            end
+            if loader then loader() end
+        end, true, true)
+        return true
+    end
+    return false
+end
+
+-- Validate key function
+function Validator.ValidateKey(token, key, loader, isAuto, isSavedKey)
+    debug("Validating key: " .. tostring(key))
+    if not currentHWID then
+        debug("No HWID available for validation")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("HWID not available. Please restart.", "error")
+        end
+        return
+    end
+    
+    -- Rate limit kontrolü (manuel denemelerde)
+    if not isAuto then
+        local allowed, waitTime = canValidate()
+        if not allowed then
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage("Please wait " .. waitTime .. "s before trying", "warning")
+            end
+            return
+        end
+    end
+    
+    -- Backend ile key doğrula
+    local result = validateKey(key, currentHWID)
+    if result then
+        debug("Key validation result", result)
+        if result.success then
+            debug("Key validation successful: " .. tostring(result.type))
+            
+            -- Sadece normal/default key'leri kaydet
+            if result.type == "normal" or result.type == "default" then
+                local _, _, duration = getTokenDiscordDuration()
+                if duration then
+                    saveObfuscatedKey(key, currentHWID, duration)
+                else
+                    saveObfuscatedKey(key, currentHWID, "10h") -- fallback
+                end
+            end
+            
+            if isSavedKey then
+                if _G.SystemReceiveMessage then
+                    _G.SystemReceiveMessage("Saved Key Used", "success")
+                end
+            else
+                if _G.SystemReceiveMessage then
+                    _G.SystemReceiveMessage("Key validated successfully! Loading system...", "success")
+                end
+            end
+            
+            if _G.SystemUserValidated then
+                _G.SystemUserValidated(currentHWID, key, result.type)
+            end
+            if loader then loader() end
+            return true
+        else
+            debug("Key validation failed: " .. tostring(result.message or "Unknown error"))
+            removeSavedKey()
+            if _G.SystemReceiveMessage then
+                _G.SystemReceiveMessage(result.message or "Unknown error", "error")
+            end
+            if _G.SystemShowKeyInput then
+                _G.SystemShowKeyInput()
+            end
+        end
+    else
+        debug("Validation request failed")
+        if _G.SystemReceiveMessage then
+            _G.SystemReceiveMessage("Network error", "error")
+        end
+    end
+end
+
+-- Utility functions
+function Validator.SetDebug(enabled)
+    DEBUG_MODE = enabled
+    debug("Debug mode " .. (enabled and "enabled" or "disabled"))
+end
+
+function Validator.GetStatus()
+    return {
+        token = currentToken,
+        hwid = currentHWID,
+        debug = DEBUG_MODE,
+        version = OBFUSCATE_VERSION,
+        fileFunctions = checkFileFunctions()
+    }
+end
+
+function Validator.HealthCheck()
+    debug("Performing health check...")
+    local result = makeRequest("/health")
+    
+    if result and result.success then
+        debug("Health check passed")
+        return true
+    else
+        debug("Health check failed")
+        return false
+    end
+end
+
+-- Manual key removal function
+function Validator.ClearSavedKey()
+    removeSavedKey()
+    debug("Saved key manually cleared")
+end
+
+-- Pages ile iletişim için özel obfuscate (network)
+local NET_SIGNATURE = "KEYGUARDIAN2024"
+local NET_KEY = "KeyGuardianSecret"
+local function net_simple_hash(str)
+    local hash = 5381
+    for i = 1, #str do
+        hash = bit32.band(bit32.lshift(hash, 5) + hash + string.byte(str, i), 0xFFFFFFFF)
+    end
+    return string.format("%08x", hash)
+end
+local function net_xor_crypt(data, key)
+    local out = {}
+    for i = 1, #data do
+        local k = string.byte(key, ((i-1) % #key) + 1)
+        out[i] = string.char(bit32.bxor(string.byte(data, i), k))
+    end
+    return table.concat(out)
+end
+local function net_base64_encode(data)
+    local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    return ((data:gsub('.', function(x)
+        local r,b='',x:byte()
+        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+        return r
+    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if (#x < 6) then return '' end
+        return b:sub(tonumber(x,2)+1,tonumber(x,2)+1)
+    end)..({ '', '==', '=' })[#data%3+1])
+end
+local function net_base64_decode(data)
+    local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    data = string.gsub(data, '[^'..b..'=]', '')
+    return (data:gsub('.', function(x)
+        if (x == '=') then return '' end
+        local r,f='',(b:find(x)-1)
+        for i=6,1,-1 do r=r..(f%2^i-f%2^(i-1)>0 and '1' or '0') end
+        return r
+    end):gsub('%d%d%d%d%d%d%d%d', function(x)
+        return string.char(tonumber(x,2))
+    end))
+end
+local function net_hex_encode(data)
+    return (data:gsub('.', function(c) return string.format('%02x', string.byte(c)) end))
+end
+local function net_hex_decode(data)
+    return (data:gsub('..', function(cc) return string.char(tonumber(cc, 16)) end))
+end
+function net_obfuscate(payload)
+    local json = game:GetService("HttpService"):JSONEncode(payload)
+    local xored = net_xor_crypt(json, NET_KEY)
+    local b64 = net_base64_encode(xored)
+    local encoded = b64 or net_hex_encode(xored)
+    local hash = net_simple_hash(encoded)
+    local obfuscated = NET_SIGNATURE .. hash .. encoded .. NET_SIGNATURE
+    if NoNOBFUSCATEDDEBUG_MODE then debug("[OBFUSCATED] Sent (network):", obfuscated) end
+    return obfuscated
+end
+function net_deobfuscate(obf)
+    if NoNOBFUSCATEDDEBUG_MODE then debug("[OBFUSCATED] Received (network):", obf) end
+    if type(obf) ~= "string" then return nil, "not string" end
+    if obf:sub(1, #NET_SIGNATURE) ~= NET_SIGNATURE or obf:sub(-#NET_SIGNATURE) ~= NET_SIGNATURE then
+        return nil, "signature missing"
+    end
+    local content = obf:sub(#NET_SIGNATURE+1, -#NET_SIGNATURE-1)
+    local hash = content:sub(1, 8)
+    local encoded = content:sub(9)
+    if net_simple_hash(encoded) ~= hash then return nil, "hash mismatch" end
+    local decoded = net_base64_decode(encoded) or net_hex_decode(encoded)
+    if not decoded then return nil, "decode fail" end
+    local json = game:GetService("HttpService"):JSONDecode(net_xor_crypt(decoded, NET_KEY))
+    return json, nil
+end
+
+local NoNOBFUSCATEDDEBUG_MODE = false
+function Validator.SetNoNObfuscatedDebug(enabled)
+    NoNOBFUSCATEDDEBUG_MODE = enabled
+    debug("NoNOBFUSCATEDDEBUG_MODE " .. (enabled and "enabled" or "disabled"))
+end
+
+return Validator
